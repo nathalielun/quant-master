@@ -18,11 +18,11 @@ const PORTFOLIO = [
 ];
 
 // ─── CACHE ────────────────────────────────────────────────────────────────────
-const CACHE_KEY = "qm_data_v6";
-const CACHE_DATE_KEY = "qm_date_v6";
-const WL_KEY = "qm_wl_v6";
-const PM_KEY = "qm_pm_v6";
-const PM_DATE_KEY = "qm_pm_date_v6";
+const CACHE_KEY = "qm_data_v7";
+const CACHE_DATE_KEY = "qm_date_v7";
+const WL_KEY = "qm_wl_v7";
+const PM_KEY = "qm_pm_v7";
+const PM_DATE_KEY = "qm_pm_date_v7";
 const getToday = () => new Date().toISOString().slice(0, 10);
 const readCache = () => { try { if (localStorage.getItem(CACHE_DATE_KEY) !== getToday()) return null; const r = localStorage.getItem(CACHE_KEY); return r ? JSON.parse(r) : null; } catch { return null; } };
 const writeCache = (d) => { try { localStorage.setItem(CACHE_KEY, JSON.stringify(d)); localStorage.setItem(CACHE_DATE_KEY, getToday()); } catch {} };
@@ -169,6 +169,19 @@ const interpret = {
 // ─── SCANNER ──────────────────────────────────────────────────────────────────
 const passes = (q, spyRS) => q && q.ma50 && q.ma200 && q.price > q.ma50 && q.price > q.ma200 && (q.ret3m - spyRS) > 5 && q.pctFromHigh > -20;
 const score = (q, spyRS) => (q.ret3m - spyRS) + (100 + q.pctFromHigh) * 0.25 + (q.volRatio > 1.5 ? 8 : 0);
+
+// Unified rating — identical logic for scanner AND watchlist
+// STRONG = above both MAs + RS >20% + near highs → best setups, consider buying
+// WATCH  = above both MAs + RS positive → decent, wait for better entry or breakout
+// SPEC   = above one MA, RS marginally positive → risky/speculative only
+// WEAK   = below key MAs or negative RS → avoid, not a good setup right now
+const getRating = (rs, aboveMa50, aboveMa200, pctFromHigh) => {
+  if (rs == null) return { label: "—", color: "blue" };
+  if (aboveMa50 && aboveMa200 && rs > 20 && pctFromHigh > -15) return { label: "STRONG", color: "green" };
+  if (aboveMa50 && aboveMa200 && rs > 5)                       return { label: "WATCH",  color: "yellow" };
+  if ((aboveMa50 || aboveMa200) && rs > 0)                     return { label: "SPEC",   color: "blue" };
+  return { label: "WEAK", color: "red" };
+};
 
 // ─── DESIGN ───────────────────────────────────────────────────────────────────
 const C = { bg: "#050A0E", s1: "#080F15", s2: "#0D1825", b1: "#0D1F2D", b2: "#1A3A5C", accent: "#00D4FF", green: GREEN, red: RED, yellow: YELLOW, dim: DIM, text: "#D8E8F0", bright: "#F0F8FF" };
@@ -456,16 +469,16 @@ export default function App() {
       setScanDone(prev => prev + 1);
       await new Promise(r => setTimeout(r, 150));
     }
-    // Remaining in batches of 3
+    // Remaining in batches of 2 (slower = more reliable)
     const remaining = allTickers.filter(t => !priority.includes(t));
     const batches = [];
-    for (let i = 0; i < remaining.length; i += 3) batches.push(remaining.slice(i, i + 3));
+    for (let i = 0; i < remaining.length; i += 2) batches.push(remaining.slice(i, i + 2));
     for (const batch of batches) {
       setScanCurrent(batch.join(", "));
       const fetched = await Promise.all(batch.map(fetchQuote));
       fetched.forEach((q, i) => { if (q) { results[batch[i]] = q; setQuotes(prev => ({ ...prev, [batch[i]]: q })); } });
       setScanDone(prev => prev + batch.length);
-      await new Promise(r => setTimeout(r, 280));
+      await new Promise(r => setTimeout(r, 500));
     }
     writeCache(results);
     setLastUpdated(new Date());
@@ -488,8 +501,12 @@ export default function App() {
   const wlMomentum = watchlist.map(t => {
     const q = quotes[t];
     if (!q) return { ticker: t, rs: null, price: null };
-    return { ...q, rs: q.ret3m - spyRS, aboveMa50: q.ma50 && q.price > q.ma50, aboveMa200: q.ma200 && q.price > q.ma200 };
-  }).sort((a, b) => (b.rs ?? -999) - (a.rs ?? -999));
+    const rs = q.ret3m - spyRS;
+    const aboveMa50 = !!(q.ma50 && q.price > q.ma50);
+    const aboveMa200 = !!(q.ma200 && q.price > q.ma200);
+    const sc = score(q, spyRS);
+    return { ...q, rs, aboveMa50, aboveMa200, sc };
+  }).sort((a, b) => (b.sc ?? -999) - (a.sc ?? -999));
 
   const scanByTheme = {}; let totalHits = 0;
   Object.entries(SCAN_UNIVERSE).forEach(([theme, tickers]) => {
@@ -594,10 +611,9 @@ export default function App() {
                     <tbody>
                       {stocks.map((q, i) => {
                         const isOn = addedSet.has(q.ticker) || watchlist.includes(q.ticker);
-                        const rating = q.rs > 20 && q.pctFromHigh > -10 ? "STRONG" : q.rs > 10 ? "WATCH" : "SPEC";
-                        const rCol = rating === "STRONG" ? "green" : rating === "WATCH" ? "yellow" : "blue";
+                        const { label: rating, color: rCol } = getRating(q.rs, true, true, q.pctFromHigh);
                         return (
-                          <tr key={q.ticker} style={{ background: i % 2 === 0 ? C.s1 : C.bg, borderLeft: `4px solid ${rating === "STRONG" ? C.green : rating === "WATCH" ? C.yellow : C.accent}` }}>
+                          <tr key={q.ticker} style={{ background: i % 2 === 0 ? C.s1 : C.bg, borderLeft: `4px solid ${rCol === "green" ? C.green : rCol === "yellow" ? C.yellow : rCol === "red" ? C.red : C.accent}` }}>
                             <td style={{ ...TD, fontFamily: F.base, fontWeight: 800, fontSize: "18px", color: C.accent }}>{q.ticker}</td>
                             <td style={{ ...TD, fontFamily: F.mono }}>${q.price?.toFixed(2)}</td>
                             <td style={{ ...TD, fontFamily: F.mono, color: q.changePct >= 0 ? C.green : C.red, fontWeight: 600 }}>{q.changePct >= 0 ? "+" : ""}{q.changePct?.toFixed(2)}%</td>
@@ -622,14 +638,22 @@ export default function App() {
           {/* WATCHLIST TAB */}
           {tab === "watchlist" && (
             <div style={{ background: C.s1 }}>
-              <div style={{ padding: "14px 22px", background: C.s2, borderBottom: `1px solid ${C.b1}`, fontFamily: F.mono, fontSize: "13px", color: C.dim }}>
-                RS = 3-month return minus SPY baseline (SPY: {spyRS > 0 ? "+" : ""}{spyRS.toFixed(1)}%) · Sorted strongest first · {loading ? "Still loading..." : `${wlQ.length}/${watchlist.length} stocks loaded`}
+              <div style={{ padding: "14px 22px", background: C.s2, borderBottom: `1px solid ${C.b1}`, fontFamily: F.mono, fontSize: "13px", color: C.dim, display: "flex", gap: "28px", alignItems: "center", flexWrap: "wrap" }}>
+                <span>Sorted by strength score (best setup first) · SPY baseline: {spyRS > 0 ? "+" : ""}{spyRS.toFixed(1)}% · {loading ? "Still loading..." : `${wlQ.length}/${watchlist.length} loaded`}</span>
+                <span style={{ marginLeft: "auto", display: "flex", gap: "18px" }}>
+                  {[["STRONG = best setup", C.green], ["WATCH = decent", C.yellow], ["SPEC = risky", C.accent], ["WEAK = avoid", C.red]].map(([l, col]) => (
+                    <span key={l} style={{ color: col }}>● {l}</span>
+                  ))}
+                </span>
               </div>
               <table style={{ width: "100%", borderCollapse: "collapse" }}>
-                <thead><tr>{["#","Ticker","Price","Today","RS vs SPY","vs 50MA","vs 200MA","From High","Vol","Status","Remove"].map(h => <th key={h} style={TH}>{h}</th>)}</tr></thead>
+                <thead><tr>{["#","Ticker","Price","Today","RS vs SPY","vs 50MA","vs 200MA","From High","Vol","Rating","Remove"].map(h => <th key={h} style={TH}>{h}</th>)}</tr></thead>
                 <tbody>
-                  {wlMomentum.map((q, i) => (
-                    <tr key={q.ticker} style={{ background: i % 2 === 0 ? C.s1 : C.bg, borderLeft: i < 5 ? `4px solid ${C.green}` : i < 12 ? `4px solid ${C.yellow}` : `4px solid ${C.b1}` }}>
+                  {wlMomentum.map((q, i) => {
+                    const { label: rating, color: rCol } = getRating(q.rs, q.aboveMa50, q.aboveMa200, q.pctFromHigh);
+                    const borderCol = rCol === "green" ? C.green : rCol === "yellow" ? C.yellow : rCol === "red" ? C.red : C.b1;
+                    return (
+                    <tr key={q.ticker} style={{ background: i % 2 === 0 ? C.s1 : C.bg, borderLeft: `4px solid ${borderCol}` }}>
                       <td style={{ ...TD, fontFamily: F.mono, color: C.dim }}>{i + 1}</td>
                       <td style={{ ...TD, fontFamily: F.base, fontWeight: 800, fontSize: "18px", color: C.accent }}>{q.ticker}</td>
                       <td style={{ ...TD, fontFamily: F.mono }}>{q.price ? `$${q.price.toFixed(2)}` : <span style={{ color: C.dim, fontSize: "14px" }}>Loading...</span>}</td>
@@ -639,10 +663,11 @@ export default function App() {
                       <td style={TD}>{q.aboveMa200 != null ? <Pill color={q.aboveMa200 ? "green" : "red"} text={q.aboveMa200 ? "ABOVE" : "BELOW"} /> : "—"}</td>
                       <td style={{ ...TD, fontFamily: F.mono, color: q.pctFromHigh > -10 ? C.green : q.pctFromHigh > -25 ? C.yellow : C.red, fontWeight: 600 }}>{q.pctFromHigh != null ? `${q.pctFromHigh.toFixed(1)}%` : "—"}</td>
                       <td style={{ ...TD, fontFamily: F.mono, color: q.volRatio > 1.5 ? C.green : q.volRatio < 0.7 ? C.red : C.dim }}>{q.volRatio ? `${q.volRatio.toFixed(1)}x` : "—"}</td>
-                      <td style={TD}>{q.rs != null ? <Pill color={q.aboveMa50 && q.rs > 5 ? "green" : q.rs > 0 ? "yellow" : "red"} text={q.aboveMa50 && q.rs > 5 ? "ACTIVE" : q.rs > 0 ? "MONITOR" : "WEAK"} /> : "—"}</td>
+                      <td style={TD}>{q.rs != null ? <Pill color={rCol} text={rating} /> : "—"}</td>
                       <td style={TD}><button onClick={() => removeFromWL(q.ticker)} style={{ background: "rgba(255,68,85,0.08)", border: `1px solid rgba(255,68,85,0.2)`, color: C.red, padding: "7px 14px", cursor: "pointer", fontFamily: F.base, fontWeight: 600, fontSize: "14px", borderRadius: "4px" }}>✕ Remove</button></td>
                     </tr>
-                  ))}
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
