@@ -22,12 +22,11 @@ const store = {
 };
 
 // Scan cache: keyed by date, stores {ticker: quoteObj}
-const SCAN_KEY  = "qm_scan_v9";
-const SCAN_DATE = "qm_scan_date_v9";
-const WL_KEY    = "qm_wl_v9";
-// Pre-market cache: keyed by date
-const PM_KEY    = "qm_pm_v9";
-const PM_DATE   = "qm_pm_date_v9";
+const SCAN_KEY  = "qm_scan_v10";
+const SCAN_DATE = "qm_scan_date_v10";
+const WL_KEY    = "qm_wl_v10";
+const PM_KEY    = "qm_pm_v10";
+const PM_DATE   = "qm_pm_date_v10";
 
 const readScanCache = () => {
   if (store.get(SCAN_DATE) !== TODAY()) return null;
@@ -44,107 +43,97 @@ const writePMCache = (d) => { store.set(PM_KEY, d); store.set(PM_DATE, TODAY());
 const readWL  = () => store.get(WL_KEY) || [...DEFAULT_WATCHLIST];
 const writeWL = (wl) => store.set(WL_KEY, wl);
 
-// ─── FETCH ─────────────────────────────────────────────────────────────────────
-// Rotate proxies so one doesn't get hammered
-const PROXIES = [
-  (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
-  (u) => `https://corsproxy.io/?${encodeURIComponent(u)}`,
-  (u) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}`,
-];
-let _proxyIdx = 0;
-const nextProxy = () => { const p = PROXIES[_proxyIdx % PROXIES.length]; _proxyIdx++; return p; };
-
-const fetchJSON = async (url, timeoutMs = 10000) => {
-  // Try each proxy once
-  for (let i = 0; i < PROXIES.length; i++) {
-    const proxy = PROXIES[(i + _proxyIdx) % PROXIES.length];
-    try {
-      const res = await fetch(proxy(url), { signal: AbortSignal.timeout(timeoutMs) });
-      if (!res.ok) continue;
-      const text = await res.text();
-      if (!text || text.length < 30) continue;
-      return JSON.parse(text);
-    } catch { continue; }
-  }
-  return null;
-};
+// ─── FINNHUB API ──────────────────────────────────────────────────────────────
+// Direct CORS-open API — no proxy needed, 60 calls/min free tier
+const FH_KEY  = "d6pd0ahr01qo88aio0mgd6pd0ahr01qo88aio0n0";
+const FH_BASE = "https://finnhub.io/api/v1";
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-// ─── QUOTE PARSER (uses 1y chart for MA200 + ATR) ─────────────────────────────
-const fetchQuote = async (ticker, retries = 2) => {
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    try {
-      if (attempt > 0) await sleep(800 * attempt); // back-off on retry
-      const url = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1d&range=1y`;
-      const data = await fetchJSON(url);
-      const r = data?.chart?.result?.[0];
-      if (!r) continue;
-      const q = r.indicators?.quote?.[0] || {};
-      const closes  = (q.close  || []).filter(Boolean);
-      const highs   = (q.high   || []);
-      const lows    = (q.low    || []);
-      const volumes = (q.volume || []);
-      if (closes.length < 20) continue;
-      const price = r.meta?.regularMarketPrice || closes[closes.length - 1];
-      if (!price || price <= 0) continue;
-      const prev       = closes[closes.length - 2];
-      const changePct  = prev ? ((price - prev) / prev) * 100 : 0;
-      const ma50       = closes.length >= 50  ? closes.slice(-50).reduce((a,b)=>a+b,0)  / 50  : null;
-      const ma200      = closes.length >= 200 ? closes.slice(-200).reduce((a,b)=>a+b,0) / 200 : null;
-      const trs = [];
-      for (let i = Math.max(1, highs.length - 14); i < highs.length; i++) {
-        if (highs[i] && lows[i] && closes[i-1])
-          trs.push(Math.max(highs[i]-lows[i], Math.abs(highs[i]-closes[i-1]), Math.abs(lows[i]-closes[i-1])));
-      }
-      const atr        = trs.length ? trs.reduce((a,b)=>a+b,0) / trs.length : null;
-      const ret3m      = closes.length >= 63
-        ? ((price - closes[closes.length-63]) / closes[closes.length-63]) * 100
-        : ((price - closes[0]) / closes[0]) * 100;
-      const w52High    = Math.max(...closes);
-      const w52Low     = Math.min(...closes);
-      const pctFromHigh = ((price - w52High) / w52High) * 100;
-      const validVols  = volumes.filter(Boolean);
-      const avgVol     = validVols.length >= 20 ? validVols.slice(-20).reduce((a,b)=>a+b,0)/20 : null;
-      const volRatio   = avgVol && validVols[validVols.length-1] ? validVols[validVols.length-1]/avgVol : null;
-      return { ticker, price, changePct, ma50, ma200, atr, ret3m, w52High, w52Low, pctFromHigh, volRatio };
-    } catch { continue; }
-  }
-  return null;
+// Finnhub: get current quote (price, change%)
+const fhQuote = async (symbol) => {
+  try {
+    const res = await fetch(`${FH_BASE}/quote?symbol=${symbol}&token=${FH_KEY}`, { signal: AbortSignal.timeout(8000) });
+    if (!res.ok) return null;
+    const d = await res.json();
+    if (!d.c || d.c <= 0) return null;
+    return { price: d.c, changePct: d.dp || 0, prevClose: d.pc };
+  } catch { return null; }
+};
+
+// Finnhub: get daily candles (for MA50, MA200, ATR, ret3m etc)
+// resolution D, from = unix timestamp 400 days ago, to = now
+const fhCandles = async (symbol) => {
+  try {
+    const to   = Math.floor(Date.now() / 1000);
+    const from = to - 400 * 24 * 3600; // 400 calendar days back (~280 trading days)
+    const res  = await fetch(`${FH_BASE}/stock/candle?symbol=${symbol}&resolution=D&from=${from}&to=${to}&token=${FH_KEY}`, { signal: AbortSignal.timeout(10000) });
+    if (!res.ok) return null;
+    const d = await res.json();
+    if (d.s !== "ok" || !d.c || d.c.length < 20) return null;
+    return { closes: d.c, highs: d.h, lows: d.l, vols: d.v };
+  } catch { return null; }
+};
+
+// Build full quote object from candle data + live quote
+const buildQuote = (ticker, candles, liveQ) => {
+  if (!candles || !liveQ) return null;
+  const { closes, highs, lows, vols } = candles;
+  const price     = liveQ.price;
+  const changePct = liveQ.changePct;
+  // append today's price so MA calcs include it
+  const allCloses = [...closes, price];
+  const ma50  = allCloses.length>=50  ? allCloses.slice(-50).reduce((a,b)=>a+b,0)/50   : null;
+  const ma200 = allCloses.length>=200 ? allCloses.slice(-200).reduce((a,b)=>a+b,0)/200 : null;
+  const trs = [];
+  for (let i=Math.max(1,highs.length-14); i<highs.length; i++)
+    if (highs[i]&&lows[i]&&closes[i-1]) trs.push(Math.max(highs[i]-lows[i],Math.abs(highs[i]-closes[i-1]),Math.abs(lows[i]-closes[i-1])));
+  const atr = trs.length ? trs.reduce((a,b)=>a+b,0)/trs.length : null;
+  const ret3m = allCloses.length>=63 ? ((price-allCloses[allCloses.length-63])/allCloses[allCloses.length-63])*100 : ((price-allCloses[0])/allCloses[0])*100;
+  const w52High = Math.max(...allCloses);
+  const w52Low  = Math.min(...allCloses);
+  const pctFromHigh = ((price-w52High)/w52High)*100;
+  const validVols = (vols||[]).filter(Boolean);
+  const avgVol = validVols.length>=20 ? validVols.slice(-20).reduce((a,b)=>a+b,0)/20 : null;
+  const volRatio = avgVol&&validVols[validVols.length-1] ? validVols[validVols.length-1]/avgVol : null;
+  return { ticker, price, changePct, ma50, ma200, atr, ret3m, w52High, w52Low, pctFromHigh, volRatio };
+};
+
+// Fetch one stock — quote + candles in parallel (2 calls)
+const fetchQuote = async (ticker) => {
+  const [q, c] = await Promise.allSettled([ fhQuote(ticker), fhCandles(ticker) ]);
+  const quote   = q.status==="fulfilled" ? q.value : null;
+  const candles = c.status==="fulfilled" ? c.value : null;
+  return buildQuote(ticker, candles, quote);
 };
 
 // ─── PRE-MARKET DATA ──────────────────────────────────────────────────────────
-// These use 5-day range — much smaller payload, load fast
-const fetchSimple = async (sym) => {
-  try {
-    const data = await fetchJSON(`https://query1.finance.yahoo.com/v8/finance/chart/${sym}?interval=1d&range=5d`);
-    const r = data?.chart?.result?.[0];
-    if (!r) return null;
-    const closes = (r.indicators?.quote?.[0]?.close || []).filter(Boolean);
-    const price  = r.meta?.regularMarketPrice || closes[closes.length-1];
-    const prev   = closes[closes.length-2];
-    return price ? { price, changePct: prev ? ((price-prev)/prev)*100 : 0 } : null;
-  } catch { return null; }
+// Finnhub forex/index endpoints for macro indicators
+// VIX, 10Y, DXY, Futures via Finnhub quote endpoint with correct symbols
+const PM_SYMBOLS = {
+  vix:    "^VIX",       // CBOE VIX
+  t10y:   "^TNX",       // 10Y Treasury yield
+  dxy:    "DXY",        // US Dollar index (Finnhub uses DXY)
+  nq:     "NQ1!",       // Nasdaq futures
+  es:     "ES1!",       // S&P futures
+  spy:    "SPY",
+  qqq:    "QQQ",
+  spxa50r:"^SPXA50R",   // S&P 500 stocks above 50MA
 };
+
+// Simple quote for PM panel (just price + changePct)
+const fetchSimple = async (sym) => fhQuote(sym);
 
 const loadPreMarket = async () => {
   const cached = readPMCache();
   if (cached) return cached;
-  // Load all PM tickers in parallel — small payloads, fine to parallel
-  const [vix, t10y, dxy, nq, es, spy, qqq, spxa50r] = await Promise.allSettled([
-    fetchSimple("%5EVIX"),
-    fetchSimple("%5ETNX"),
-    fetchSimple("DX-Y.NYB"),
-    fetchSimple("NQ%3DF"),
-    fetchSimple("ES%3DF"),
-    fetchSimple("SPY"),
-    fetchSimple("QQQ"),
-    fetchSimple("%5ESPXA50R"),  // S&P 500 stocks above 50MA — market breadth
-  ]);
-  const get = (r) => r.status === "fulfilled" ? r.value : null;
-  const result = { vix: get(vix), t10y: get(t10y), dxy: get(dxy), nq: get(nq), es: get(es), spy: get(spy), qqq: get(qqq), spxa50r: get(spxa50r) };
-  writePMCache(result);
-  return result;
+  // All 8 PM symbols fetched in parallel — Finnhub handles it, no rate limit issue at this size
+  const keys = Object.keys(PM_SYMBOLS);
+  const results = await Promise.allSettled(keys.map(k => fhQuote(PM_SYMBOLS[k])));
+  const obj = {};
+  keys.forEach((k, i) => { obj[k] = results[i].status==="fulfilled" ? results[i].value : null; });
+  writePMCache(obj);
+  return obj;
 };
 
 // ─── PLAIN ENGLISH SUMMARIES ──────────────────────────────────────────────────
@@ -619,22 +608,31 @@ export default function App() {
     setFromCache(false);
     const results = {};
 
-    // 1. Priority: SPY, QQQ, watchlist first — sequential, one at a time
+    // Finnhub free = 60 API calls/min. Each stock = 2 calls (quote + candles).
+    // 5 stocks at a time = 10 calls/batch. Wait 1.2s between batches = safe.
+    const runBatch = async (tickers) => {
+      const batch = await Promise.allSettled(tickers.map(t => fetchQuote(t)));
+      batch.forEach((r, i) => {
+        if (r.status==="fulfilled" && r.value) {
+          results[tickers[i]] = r.value;
+          setQuotes(prev => ({ ...prev, [tickers[i]]: r.value }));
+        }
+        setScanDone(prev => prev + 1);
+      });
+    };
+
+    // 1. Priority first: SPY, QQQ, watchlist (show these ASAP)
     const priority = ["SPY","QQQ",...watchlist];
-    for (const t of priority) {
-      const q = await fetchQuote(t, 2);
-      if (q) { results[t]=q; setQuotes(prev=>({...prev,[t]:q})); }
-      setScanDone(prev=>prev+1);
-      await sleep(400); // 400ms between each = reliable
+    for (let i=0; i<priority.length; i+=5) {
+      await runBatch(priority.slice(i, i+5));
+      if (i+5 < priority.length) await sleep(1200);
     }
 
-    // 2. Scan universe — sequential, one at a time, 350ms gap
-    const remaining = ALL_SCAN_TICKERS.filter(t=>!priority.includes(t));
-    for (const t of remaining) {
-      const q = await fetchQuote(t, 1); // 1 retry only for scan tickers
-      if (q) { results[t]=q; setQuotes(prev=>({...prev,[t]:q})); }
-      setScanDone(prev=>prev+1);
-      await sleep(350);
+    // 2. Remaining scan universe
+    const remaining = ALL_SCAN_TICKERS.filter(t => !priority.includes(t));
+    for (let i=0; i<remaining.length; i+=5) {
+      await runBatch(remaining.slice(i, i+5));
+      if (i+5 < remaining.length) await sleep(1200);
     }
 
     writeScanCache(results);
