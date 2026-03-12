@@ -203,7 +203,7 @@ const BreadthGauge = ({ value }) => {
   const angle = (value / 100) * 180 - 90;
   return (
     <div style={{ display: "flex", flexDirection: "column", alignItems: "center", padding: "24px 20px" }}>
-      <svg width="170" height: "96" viewBox="0 0 170 96">
+      <svg width="170" height="96" viewBox="0 0 170 96">
         <path d="M12,88 A73,73 0 0,1 158,88" fill="none" stroke={C.b1} strokeWidth="14" strokeLinecap="round" />
         <path d="M12,88 A73,73 0 0,1 158,88" fill="none" stroke={color} strokeWidth="9" strokeLinecap="round" strokeDasharray={`${(value / 100) * 230} 230`} style={{ transition: "stroke-dasharray 1s ease" }} />
         <line x1="85" y1="88" x2="85" y2="26" stroke={color} strokeWidth="3" strokeLinecap="round" transform={`rotate(${angle},85,88)`} />
